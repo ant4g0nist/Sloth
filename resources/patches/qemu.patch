@@ -1,0 +1,765 @@
+diff --git a/accel/tcg/tcg-runtime.h b/accel/tcg/tcg-runtime.h
+index 4eda24e..3675074 100644
+--- a/accel/tcg/tcg-runtime.h
++++ b/accel/tcg/tcg-runtime.h
+@@ -320,3 +320,4 @@ DEF_HELPER_FLAGS_4(gvec_leu32, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+ DEF_HELPER_FLAGS_4(gvec_leu64, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+ 
+ DEF_HELPER_FLAGS_5(gvec_bitsel, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, ptr, i32)
++DEF_HELPER_FLAGS_1(afl_maybe_log, TCG_CALL_NO_RWG, void, tl)
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 2d83013..5d91dad 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -58,6 +58,60 @@
+ #include "exec/log.h"
+ #include "sysemu/cpus.h"
+ #include "sysemu/tcg.h"
++#include "tcg/tcg-op.h"
++
++/* ************************************************************************ */
++/* ************************* FUZZ UTILS *********************************** */
++/* ************************************************************************ */
++
++#define MAP_SIZE_POW2 16
++#define MAP_SIZE (1 << MAP_SIZE_POW2)
++
++__thread abi_ulong afl_prev_loc;
++
++/* coverage bitmap */
++extern unsigned char *afl_area_ptr;
++
++/* NeverZero */
++
++#if (defined(__x86_64__) || defined(__i386__)) && defined(AFL_QEMU_NOT_ZERO)
++  #define INC_AFL_AREA(loc)           \
++    asm volatile(                     \
++        "addb $1, (%0, %1, 1)\n"      \
++        "adcb $0, (%0, %1, 1)\n"      \
++        : /* no out */                \
++        : "r"(afl_area_ptr), "r"(loc) \
++        : "memory", "eax")
++#else
++  #define INC_AFL_AREA(loc) afl_area_ptr[loc]++
++#endif
++
++void HELPER(afl_maybe_log)(target_ulong cur_loc) {
++
++  register uintptr_t afl_idx = cur_loc ^ afl_prev_loc;
++
++  INC_AFL_AREA(afl_idx);
++
++  afl_prev_loc = cur_loc >> 1;
++
++}
++
++/* Generates TCG code for AFL's tracing instrumentation. */
++static void afl_gen_trace(target_ulong cur_loc) {
++
++  /* Looks like QEMU always maps to fixed locations, so ASLR is not a
++     concern. Phew. But instruction addresses may be aligned. Let's mangle
++     the value to get something quasi-uniform. */
++
++  cur_loc = (cur_loc >> 4) ^ (cur_loc << 8);
++  cur_loc &= MAP_SIZE - 1;
++
++  TCGv cur_loc_v = tcg_const_tl(cur_loc);
++  gen_helper_afl_maybe_log(cur_loc_v);
++  tcg_temp_free(cur_loc_v);
++}
++
++/* ************************************************************************ */
+ 
+ /* #define DEBUG_TB_INVALIDATE */
+ /* #define DEBUG_TB_FLUSH */
+@@ -1740,6 +1794,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+     tcg_func_start(tcg_ctx);
+ 
+     tcg_ctx->cpu = env_cpu(env);
++    afl_gen_trace(pc);
+     gen_intermediate_code(cpu, tb, max_insns);
+     tcg_ctx->cpu = NULL;
+ 
+diff --git a/configure b/configure
+index 2acc4d1..650afa1 100755
+--- a/configure
++++ b/configure
+@@ -6821,8 +6821,8 @@ echo_version() {
+ }
+ 
+ # prepend pixman and ftd flags after all config tests are done
+-QEMU_CFLAGS="$pixman_cflags $fdt_cflags $QEMU_CFLAGS"
+-QEMU_LDFLAGS="$fdt_ldflags $QEMU_LDFLAGS"
++QEMU_CFLAGS="$pixman_cflags $fdt_cflags $QEMU_CFLAGS -fPIC"
++QEMU_LDFLAGS="$fdt_ldflags $QEMU_LDFLAGS -shared -fPIC"
+ libs_softmmu="$pixman_libs $libs_softmmu"
+ 
+ echo "Install prefix    $prefix"
+@@ -7986,7 +7986,7 @@ echo "WINDRES=$windres" >> $config_host_mak
+ echo "CFLAGS=$CFLAGS" >> $config_host_mak
+ echo "CFLAGS_NOPIE=$CFLAGS_NOPIE" >> $config_host_mak
+ echo "QEMU_CFLAGS=$QEMU_CFLAGS" >> $config_host_mak
+-echo "QEMU_CXXFLAGS=$QEMU_CXXFLAGS" >> $config_host_mak
++echo "QEMU_CXXFLAGS=$QEMU_CXXFLAGS -fPIC" >> $config_host_mak
+ echo "QEMU_INCLUDES=$QEMU_INCLUDES" >> $config_host_mak
+ if test "$sparse" = "yes" ; then
+   echo "CC           := REAL_CC=\"\$(CC)\" cgcc"       >> $config_host_mak
+diff --git a/linux-user/Makefile.objs b/linux-user/Makefile.objs
+index 1940910..de02732 100644
+--- a/linux-user/Makefile.objs
++++ b/linux-user/Makefile.objs
+@@ -1,7 +1,8 @@
+ obj-y = main.o syscall.o strace.o mmap.o signal.o \
+ 	elfload.o linuxload.o uaccess.o uname.o \
+ 	safe-syscall.o $(TARGET_ABI_DIR)/signal.o \
+-        $(TARGET_ABI_DIR)/cpu_loop.o exit.o fd-trans.o
++        $(TARGET_ABI_DIR)/cpu_loop.o exit.o fd-trans.o \
++	elfParser.o
+ 
+ obj-$(TARGET_HAS_BFLT) += flatload.o
+ obj-$(TARGET_I386) += vm86.o
+diff --git a/linux-user/aarch64/cpu_loop.c b/linux-user/aarch64/cpu_loop.c
+index bbe9fef..55a45f7 100644
+--- a/linux-user/aarch64/cpu_loop.c
++++ b/linux-user/aarch64/cpu_loop.c
+@@ -138,6 +138,8 @@ void cpu_loop(CPUARMState *env)
+         case EXCP_ATOMIC:
+             cpu_exec_step_atomic(cs);
+             break;
++        case EXCP_HLT:
++            goto end;
+         default:
+             EXCP_DUMP(env, "qemu: unhandled CPU exception 0x%x - aborting\n", trapnr);
+             abort();
+@@ -148,6 +150,10 @@ void cpu_loop(CPUARMState *env)
+          */
+         env->exclusive_addr = -1;
+     }
++end:
++    process_pending_signals(env);
++    env->exclusive_addr = -1;
++    return ;
+ }
+ 
+ void target_cpu_copy_regs(CPUArchState *env, struct target_pt_regs *regs)
+@@ -168,7 +174,8 @@ void target_cpu_copy_regs(CPUArchState *env, struct target_pt_regs *regs)
+         env->xregs[i] = regs->regs[i];
+     }
+     env->pc = regs->pc;
+-    env->xregs[31] = regs->sp;
++    env->xregs[31] = info->start_stack;
++    // env->xregs[31] = regs->sp;
+ #ifdef TARGET_WORDS_BIGENDIAN
+     env->cp15.sctlr_el[1] |= SCTLR_E0E;
+     for (i = 1; i < 4; ++i) {
+diff --git a/linux-user/config.h b/linux-user/config.h
+new file mode 100644
+index 0000000..5d0235b
+--- /dev/null
++++ b/linux-user/config.h
+@@ -0,0 +1,13 @@
++
++#ifndef LIBQEMU_CONFIG
++#define LIBQEMU_CONFIG
++
++#include <stdint.h>
++
++#define ROOTFS  "/rootfs/"
++
++uint64_t libQemuDlsym(const char name[]);
++int libQemuInit(int argc, char **argv, char **envp);
++int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
++
++#endif
+diff --git a/linux-user/elfParser.c b/linux-user/elfParser.c
+new file mode 100644
+index 0000000..55b2dc6
+--- /dev/null
++++ b/linux-user/elfParser.c
+@@ -0,0 +1,345 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <elf.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <unistd.h>
++#include <inttypes.h>
++#include "elfParser.h"
++
++/* Align a value by rounding down to closest size.
++   e.g. Using size of 4096, we get this behavior:
++	{4095, 4096, 4097} = {0, 4096, 4096}.  */
++#define ALIGN_DOWN(base, size)	((base) & -((__typeof__ (base)) (size)))
++
++/* Align a value by rounding up to closest size.
++   e.g. Using size of 4096, we get this behavior:
++	{4095, 4096, 4097} = {4096, 4096, 8192}.
++  Note: The size argument has side effects (expanded multiple times).  */
++#define ALIGN_UP(base, size)	ALIGN_DOWN ((base) + (size) - 1, (size))
++
++//taken from https://github.com/shoumikhin/ELF-Hook/blob/master/elf_hook.c
++#define Elf_Ehdr Elf64_Ehdr
++#define Elf_Shdr Elf64_Shdr
++#define Elf_Phdr Elf64_Phdr
++#define Elf_Sym Elf64_Sym
++#define Elf_Rel Elf64_Rela
++#define ELF_R_SYM ELF64_R_SYM
++#define REL_DYN ".rela.dyn"
++#define REL_PLT ".rela.plt"
++
++static int readHeader(int d, Elf_Ehdr **header)
++{
++	*header = (Elf_Ehdr *)malloc(sizeof(Elf_Ehdr));
++	if(NULL == *header)
++	{
++		return errno;
++	}
++
++	if (lseek(d, 0, SEEK_SET) < 0)
++	{
++		free(*header);
++		return errno;
++	}
++
++	if (read(d, *header, sizeof(Elf_Ehdr)) <= 0)
++	{
++		free(*header);
++		return errno = EINVAL;
++	}
++
++	return 0;
++}
++
++static int readProgramHeaders(int d, Elf_Ehdr const *header, Elf_Phdr ** phdr)
++{
++	size_t size;
++	if (NULL == header)
++		return EINVAL;
++
++	size = header->e_phnum * sizeof(Elf_Phdr);
++	*phdr = (Elf_Phdr *)malloc(size);
++
++	if(NULL == *phdr)
++	{
++		return errno;
++	}
++
++	if (lseek(d, header->e_phoff, SEEK_SET) < 0)
++	{
++		free(*phdr);
++		return errno;
++	}
++
++	if (read(d, *phdr, size) <= 0)
++	{
++		free(*phdr);
++		return errno = EINVAL;
++	}
++
++	return 0;
++
++}
++
++static int readSectionTable(int d, Elf_Ehdr const *header, Elf_Shdr **table)
++{
++	size_t size;
++
++	if (NULL == header)
++		return EINVAL;
++
++	size = header->e_shnum * sizeof(Elf_Shdr);
++	*table = (Elf_Shdr *)malloc(size);
++	if(NULL == *table)
++	{
++		return errno;
++	}
++
++	if (lseek(d, header->e_shoff, SEEK_SET) < 0)
++	{
++		free(*table);
++		return errno;
++	}
++
++	if (read(d, *table, size) <= 0)
++	{
++		free(*table);
++		return errno = EINVAL;
++	}
++
++	return 0;
++}
++
++static int readStringTable(int d, Elf_Shdr const *section, char const **strings)
++{
++	if (NULL == section)
++		return EINVAL;
++
++	*strings = (char const *)malloc(section->sh_size);
++	if(NULL == *strings)
++	{
++		return errno;
++	}
++
++	if (lseek(d, section->sh_offset, SEEK_SET) < 0)
++	{
++		free((void *)*strings);
++		return errno;
++	}
++
++	if (read(d, (char *)*strings, section->sh_size) <= 0)
++	{
++		free((void *)*strings);
++		return errno = EINVAL;
++	}
++
++	return 0;
++}
++
++static int readSymbolTable(int d, Elf_Shdr const *section, Elf_Sym **table)
++{
++	if (NULL == section)
++		return EINVAL;
++
++	*table = (Elf_Sym *)malloc(section->sh_size);
++	if(NULL == *table)
++	{
++		return errno;
++	}
++
++	if (lseek(d, section->sh_offset, SEEK_SET) < 0)
++	{
++		free(*table);
++		return errno;
++	}
++
++	if (read(d, *table, section->sh_size) <= 0)
++	{
++		free(*table);
++		return errno = EINVAL;
++	}
++
++	return 0;
++}
++
++
++static int sectionByIndex(int d, size_t const index, Elf_Shdr **section)
++{
++	Elf_Ehdr *header = NULL;
++	Elf_Shdr *sections = NULL;
++
++	*section = NULL;
++
++	if (
++		readHeader(d, &header) ||
++		readSectionTable(d, header, &sections)
++		)
++		return errno;
++
++	if (index < header->e_shnum)
++	{
++		*section = (Elf_Shdr *)malloc(sizeof(Elf_Shdr));
++
++		if (NULL == *section)
++		{
++			free(header);
++			free(sections);
++
++			return errno;
++		}
++
++		memcpy(*section, sections + index, sizeof(Elf_Shdr));
++	}
++	else
++		return EINVAL;
++
++	free(header);
++	free(sections);
++
++	return 0;
++}
++
++static int sectionByType(int d, size_t const section_type, Elf_Shdr **section)
++{
++	Elf_Ehdr *header = NULL;
++	Elf_Shdr *sections = NULL;
++
++	*section = NULL;
++
++	if (
++		readHeader(d, &header) ||
++		readSectionTable(d, header, &sections)
++		)
++		return errno;
++
++	for (int i = 0; i < header->e_shnum; ++i)
++		if (section_type == sections[i].sh_type)
++		{
++			*section = (Elf_Shdr *)malloc(sizeof(Elf_Shdr));
++
++			if (NULL == *section)
++			{
++				free(header);
++				free(sections);
++
++				return errno;
++			}
++
++			memcpy(*section, sections + i, sizeof(Elf_Shdr));
++
++			break;
++		}
++
++	free(header);
++	free(sections);
++
++	return 0;
++}
++
++static int symbolByName(int d, Elf_Shdr *section, char const *name, Elf_Sym **symbol, size_t *index)
++{
++	Elf_Shdr *strings_section = NULL;
++	char const *strings = NULL;
++	Elf_Sym *symbols = NULL;
++	size_t amount;
++
++	*symbol = NULL;
++	*index = 0;
++
++	if (
++		sectionByIndex(d, section->sh_link, &strings_section) ||
++		readStringTable(d, strings_section, &strings) ||
++		readSymbolTable(d, section, &symbols)
++		)
++		return errno;
++
++	amount = section->sh_size / sizeof(Elf_Sym);
++
++	for (int i = 0; i < amount; ++i)
++		if (!strcmp(name, &strings[symbols[i].st_name]))
++		{
++			*symbol = (Elf_Sym *)malloc(sizeof(Elf_Sym));
++
++			if (NULL == *symbol)
++			{
++				free(strings_section);
++				free((void *)strings);
++				free(symbols);
++
++				return errno;
++			}
++
++			memcpy(*symbol, symbols + i, sizeof(Elf_Sym));
++			*index = i;
++
++			break;
++		}
++
++	free(strings_section);
++	free((void *)strings);
++	free(symbols);
++
++	return 0;
++}
++
++uint64_t findSymbol(const char libFullPath[], const char name[])
++{
++	FILE *procfile = fopen ("/proc/self/maps", "r");
++
++	if (procfile == NULL)
++		return errno;
++
++	char *line = NULL;
++	size_t linesz;
++	ssize_t len;
++	while ((len = getline (&line, &linesz, procfile)) > 0)
++	{
++		if (line[len - 1] == '\n')
++			line[len - 1] = '\0';
++
++		uint64_t start, end, offset;
++		unsigned int dmajor, dminor;
++		uint64_t ino;
++
++		int nread = -1;
++		if (sscanf (line, "%" PRIx64 "-%" PRIx64 " %*s %" PRIx64
++			  " %x:%x %" PRIu64 " %n",
++			&start, &end, &offset, &dmajor, &dminor, &ino, &nread) < 6
++			|| nread <= 0)
++		{
++			free (line);
++			return ENOEXEC;
++		}
++
++		char *file = line + nread + strspn (line + nread, " \t");
++		if (file[0] != '/' || (ino == 0 && dmajor == 0 && dminor == 0))
++		/* This line doesn't indicate a file mapping.  */
++			continue;
++
++		if (strstr(file, libFullPath)!=0)
++		{
++			int fd = open(libFullPath, 'r');
++			Elf_Ehdr *elfhdr = NULL;
++			Elf_Phdr *phdr = NULL;
++			Elf_Shdr *dynsym = NULL;
++
++			Elf_Sym *symbol = NULL;
++			size_t name_index = 0;
++
++			sectionByType(fd, SHT_DYNSYM, &dynsym);
++			symbolByName(fd, dynsym, name, &symbol, &name_index);
++
++			readHeader(fd, &elfhdr);
++			readProgramHeaders(fd, elfhdr, &phdr);
++
++			close(fd);
++			fclose(procfile);
++
++			return start+symbol->st_value;
++		}
++	}
++
++	fclose(procfile);
++	return -1;
++}
+\ No newline at end of file
+diff --git a/linux-user/elfParser.h b/linux-user/elfParser.h
+new file mode 100644
+index 0000000..f122954
+--- /dev/null
++++ b/linux-user/elfParser.h
+@@ -0,0 +1,6 @@
++#ifndef ELFPARSER_H
++#define ELFPARSER_H
++
++uint64_t findSymbol(const char libFullPath[], const char name[]);
++
++#endif
+\ No newline at end of file
+diff --git a/linux-user/elfload.c b/linux-user/elfload.c
+index fe9dfe7..a5002ac 100644
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -2948,7 +2948,8 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
+        so that we copy the original program entry point into the AUXV.  */
+     if (elf_interpreter) {
+         info->load_bias = interp_info.load_bias;
+-        info->entry = interp_info.entry;
++        // info->entry = interp_info.entry;
++        info->interp_entry = interp_info.entry;
+         free(elf_interpreter);
+     }
+ 
+@@ -3824,3 +3825,12 @@ void do_init_thread(struct target_pt_regs *regs, struct image_info *infop)
+ {
+     init_thread(regs, infop);
+ }
++
++void run_linker(struct target_pt_regs *regs, struct image_info *infop)
++{
++    abi_long stack = infop->start_stack;
++    memset(regs, 0, sizeof(*regs));
++
++    regs->pc = infop->interp_entry & ~0x3ULL;
++    regs->sp = stack;
++}
+\ No newline at end of file
+diff --git a/linux-user/linuxload.c b/linux-user/linuxload.c
+index a27e1d0..538edaa 100644
+--- a/linux-user/linuxload.c
++++ b/linux-user/linuxload.c
+@@ -159,7 +159,8 @@ int loader_exec(int fdexec, const char *filename, char **argv, char **envp,
+ 
+     if(retval>=0) {
+         /* success.  Initialize important registers */
+-        do_init_thread(regs, infop);
++        // do_init_thread(regs, infop);
++        run_linker(regs, infop);
+         return retval;
+     }
+ 
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 75c9785..ba674c0 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -47,6 +47,8 @@
+ #include "target_elf.h"
+ #include "cpu_loop-common.h"
+ #include "crypto/init.h"
++#include "elfParser.h"
++#include "config.h"
+ 
+ char *exec_path;
+ 
+@@ -615,13 +617,48 @@ static int parse_args(int argc, char **argv)
+     return optind;
+ }
+ 
+-int main(int argc, char **argv, char **envp)
++uint64_t target_addr;
++CPUArchState *env;
++struct target_pt_regs *regs;
++extern __thread abi_ulong afl_prev_loc;
++
++uint64_t libQemuDlsym(const char name[])
++{
++    char* slothTargetLibrary = getenv("SLOTH_TARGET_LIBRARY");
++    uint64_t offset = findSymbol(slothTargetLibrary, name);
++
++    if ( offset == -1)
++    {
++        printf("SYMBOL NOT FOUND\n");
++        exit(1);
++    }
++
++    return offset;
++}
++
++int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
++{
++    afl_prev_loc = 0;
++    thread_cpu->halted = 0;
++
++    regs->regs[0] = (uint64_t)Data;
++    regs->regs[1] = Size;
++    regs->pc = target_addr & ~0x3ULL;
++
++    target_cpu_copy_regs(env, regs);
++    cpu_loop(env);
++
++    return 0;
++}
++
++int libQemuInit(int argc, char **argv, char **envp)
+ {
+-    struct target_pt_regs regs1, *regs = &regs1;
++struct target_pt_regs regs1;
++    regs = &regs1;
+     struct image_info info1, *info = &info1;
+     struct linux_binprm bprm;
+     TaskState *ts;
+-    CPUArchState *env;
++    //CPUArchState * env;
+     CPUState *cpu;
+     int optind;
+     char **target_environ, **wrk;
+@@ -842,7 +879,7 @@ int main(int argc, char **argv, char **envp)
+ 
+     target_set_brk(info->brk);
+     syscall_init();
+-    signal_init();
++    // signal_init();
+ 
+     /* Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
+        generating the prologue until now so that the prologue can take
+@@ -850,6 +887,7 @@ int main(int argc, char **argv, char **envp)
+     tcg_prologue_init(tcg_ctx);
+     tcg_region_init();
+ 
++    //run linker
+     target_cpu_copy_regs(env, regs);
+ 
+     if (gdbstub) {
+@@ -860,7 +898,24 @@ int main(int argc, char **argv, char **envp)
+         }
+         gdb_handlesig(cpu, 0);
+     }
++
++    env->addr_end = info->entry; // we execute linker, i.e. till elf_entry
++    env->elf_entry = info->entry;
++    env->interp_entry = info->interp_entry;
++
+     cpu_loop(env);
++
++    //reset cache
++    cpu->halted = 0;
++    tb_flush(cpu);
++    env->addr_end = 0;
++
++    target_addr = libQemuDlsym("libQemuFuzzerTestOneInput");
++
++    argc = argc-1;
++    argv[1] = argv[2];
++    libFuzzerStart(argc, argv, LLVMFuzzerTestOneInput);
++
+     /* never exits */
+     return 0;
+ }
+diff --git a/linux-user/qemu.h b/linux-user/qemu.h
+index 5c96438..795244a 100644
+--- a/linux-user/qemu.h
++++ b/linux-user/qemu.h
+@@ -40,6 +40,7 @@ struct image_info {
+         abi_ulong       start_stack;
+         abi_ulong       stack_limit;
+         abi_ulong       entry;
++	abi_ulong 	interp_entry;
+         abi_ulong       code_offset;
+         abi_ulong       data_offset;
+         abi_ulong       saved_auxv;
+@@ -721,4 +722,9 @@ void preexit_cleanup(CPUArchState *env, int code);
+ #include "target_cpu.h"
+ #include "target_structs.h"
+ 
++typedef int (*UserCallback)(const uint8_t *Data, size_t Size);
++int libFuzzerStart(int argc, char **argv, UserCallback LLVMFuzzerTestOneInput);
++void run_linker(struct target_pt_regs *regs, struct image_info *infop);
++
+ #endif /* QEMU_H */
++
+diff --git a/target/arm/cpu.h b/target/arm/cpu.h
+index 9e8ed42..728d5ec 100644
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -262,6 +262,11 @@ typedef struct CPUARMState {
+     uint32_t usr_regs[5];
+     uint32_t fiq_regs[5];
+ 
++    /* addr_end used */
++    uint64_t addr_end;
++    uint64_t elf_entry;
++    uint64_t interp_entry;
++
+     /* cpsr flag cache for faster execution */
+     uint32_t CF; /* 0 or 1 */
+     uint32_t VF; /* V is the bit 31. All other bits are undefined */
+diff --git a/target/arm/translate-a64.c b/target/arm/translate-a64.c
+index 534c3ff..bec4b57 100644
+--- a/target/arm/translate-a64.c
++++ b/target/arm/translate-a64.c
+@@ -14543,6 +14543,13 @@ static void disas_a64_insn(CPUARMState *env, DisasContext *s)
+     uint32_t insn;
+ 
+     s->pc_curr = s->base.pc_next;
++    // we stop emulation when pc == addr_end
++    if (s->pc_curr == env->addr_end) {
++        // imitate WFI instruction to halt emulation
++        s->base.is_jmp = DISAS_WFI;
++        return;
++    }
++
+     insn = arm_ldl_code(env, s->base.pc_next, s->sctlr_b);
+     s->insn = insn;
+     s->base.pc_next += 4;
+diff --git a/util/path.c b/util/path.c
+index 8e174eb..56117f3 100644
+--- a/util/path.c
++++ b/util/path.c
+@@ -9,6 +9,7 @@
+ #include "qemu/cutils.h"
+ #include "qemu/path.h"
+ #include "qemu/thread.h"
++#include "../linux-user/config.h"
+ 
+ static const char *base;
+ static GHashTable *hash;
+@@ -50,7 +51,8 @@ const char *path(const char *name)
+         ret = value ? value : name;
+     } else {
+         char *save = g_strdup(name);
+-        char *full = g_build_filename(base, name, NULL);
++        char *full = g_build_filename(ROOTFS, name, NULL);
++        // char *full = g_build_filename(base, name, NULL);
+ 
+         /* Look for the path; record the result, pass or fail.  */
+         if (access(full, F_OK) == 0) {

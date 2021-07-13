@@ -1,0 +1,56 @@
+diff --git a/FuzzerExtraCounters.cpp b/FuzzerExtraCounters.cpp
+--- a/FuzzerExtraCounters.cpp	2021-07-06 08:59:53.000000000 +0200
++++ b/FuzzerExtraCounters.cpp	2021-07-06 09:00:59.000000000 +0200
+@@ -10,23 +10,24 @@
+ 
+ #include "FuzzerPlatform.h"
+ #include <cstdint>
++#include <cstring>
+ 
+ #if LIBFUZZER_LINUX || LIBFUZZER_NETBSD || LIBFUZZER_FREEBSD ||                \
+     LIBFUZZER_FUCHSIA || LIBFUZZER_EMSCRIPTEN
+-__attribute__((weak)) extern uint8_t __start___libfuzzer_extra_counters;
+-__attribute__((weak)) extern uint8_t __stop___libfuzzer_extra_counters;
++#define MAP_SIZE (1 << 16)
++
++extern unsigned char* afl_area_ptr;
+ 
+ namespace fuzzer {
+-uint8_t *ExtraCountersBegin() { return &__start___libfuzzer_extra_counters; }
+-uint8_t *ExtraCountersEnd() { return &__stop___libfuzzer_extra_counters; }
++uint8_t *ExtraCountersBegin() {
++		return afl_area_ptr;
++}
++uint8_t *ExtraCountersEnd() {
++	return afl_area_ptr+MAP_SIZE;
++}
+ ATTRIBUTE_NO_SANITIZE_ALL
+ void ClearExtraCounters() {  // hand-written memset, don't asan-ify.
+-  uintptr_t *Beg = reinterpret_cast<uintptr_t*>(ExtraCountersBegin());
+-  uintptr_t *End = reinterpret_cast<uintptr_t*>(ExtraCountersEnd());
+-  for (; Beg < End; Beg++) {
+-    *Beg = 0;
+-    __asm__ __volatile__("" : : : "memory");
+-  }
++	memset(afl_area_ptr, 0, MAP_SIZE);
+ }
+ 
+ }  // namespace fuzzer
+diff --git a/FuzzerMain.cpp b/FuzzerMain.cpp
+--- a/FuzzerMain.cpp	2021-07-06 08:59:54.000000000 +0200
++++ b/FuzzerMain.cpp	2021-07-06 09:00:28.000000000 +0200
+@@ -11,11 +11,7 @@
+ #include "FuzzerDefs.h"
+ #include "FuzzerPlatform.h"
+ 
+-extern "C" {
+-// This function should be defined by the user.
+-int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+-}  // extern "C"
+-
+-ATTRIBUTE_INTERFACE int main(int argc, char **argv) {
++typedef int (*UserCallback)(const uint8_t *Data, size_t Size);
++extern "C" int libFuzzerStart(int argc, char **argv, UserCallback LLVMFuzzerTestOneInput) {
+   return fuzzer::FuzzerDriver(&argc, &argv, LLVMFuzzerTestOneInput);
+ }
+ 
