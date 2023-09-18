@@ -2,7 +2,7 @@
    Sloth is a fuzzing setup that makes use of libFuzzer and QEMU’s user-mode emulation (`qemu/linux-user`) on x86_64/aarch64 host to emulate aarch64 Android libraries to fuzz the target Android native library.
 
 # Introduction
-Sloth makes use of libFuzzer and QEMU’s user-mode emulation (`qemu/linux-user`) on x86_64/aarch64 host to emulate aarch64 Android libraries to fuzz the target Android native library. Internals of why and how about Sloth are available at : https://fuzzing.science/page/fuzzing-android-native-libraries-with-libfuzzer-qemu/
+Sloth makes use of libFuzzer and QEMU’s user-mode emulation (`qemu/linux-user`) on x86_64/aarch64 host to emulate aarch64 Android libraries to fuzz the target Android native library. Internals of why and how about Sloth are available at : [https://fuzzing.science/blog/Fuzzing-Android-Native-libraries-with-libFuzzer-Qemu](https://fuzzing.science/blog/Fuzzing-Android-Native-libraries-with-libFuzzer-Qemu)
 
 High level execution flow of QEMU user-mode emulation:
 
